@@ -19,30 +19,23 @@ const DAILY_VAULT_LIMIT = toUSDC(10_000); // $10,000/day vault-wide limit
 // ── Example recipients (update these before deploying!) ──
 const EXAMPLE_RECIPIENTS = [
   {
-    address: "0x0000000000000000000000000000000000000001", // Replace with real address
+    address: "0xecaa4579251a9A67f20b3e3b51be3253E36497d1", // Demo: Wife - Alice
     label: "Wife - Alice",
     purpose: "household",
     dailyLimit: toUSDC(500),
     monthlyLimit: toUSDC(5_000),
   },
   {
-    address: "0x0000000000000000000000000000000000000002", // Replace with real address
+    address: "0x92F709dDC4D633D3D95b29e7c3C10668e04dDCE8", // Demo: Son - Bob (Clowd wallet for testing)
     label: "Son - Bob",
     purpose: "allowance",
     dailyLimit: toUSDC(100),
     monthlyLimit: toUSDC(1_000),
   },
-  {
-    address: "0x0000000000000000000000000000000000000003", // Replace with real address
-    label: "Savings - Cold Wallet",
-    purpose: "savings",
-    dailyLimit: toUSDC(2_000),
-    monthlyLimit: toUSDC(20_000),
-  },
 ];
 
-// ── Agent address (Clawdbot wallet — update before deploying!) ──
-const AGENT_ADDRESS = "0x0000000000000000000000000000000000000000"; // Replace with real agent address
+// ── Agent address (Clawdbot wallet) ──
+const AGENT_ADDRESS = "0x92F709dDC4D633D3D95b29e7c3C10668e04dDCE8"; // Clowd's wallet
 
 async function main() {
   console.log("╔═══════════════════════════════════════════════════════╗");
