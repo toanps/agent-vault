@@ -8,6 +8,7 @@
  * @module agent-vault
  */
 
+const { ethers } = require('ethers');
 const { VaultContract, VaultError } = require('./vault-contract');
 const { ConditionEngine } = require('./condition-engine');
 
@@ -227,9 +228,46 @@ class AgentVaultManager {
         });
       }
 
-      // ── Step 8: Execute the transfer ────────────────────────────────
+      // ── Step 7b: V3 pre-flight checks ───────────────────────────────
+      try {
+        const maxPerTransfer = await this.vault.getMaxPerTransfer();
+        if (maxPerTransfer > 0n) {
+          const maxUsd = parseFloat(this.vault.fromUsdcUnits(maxPerTransfer));
+          if (amount > maxUsd) {
+            return this._formatDenial({
+              amount,
+              reason,
+              label: recipientConfig.label,
+              senderAddress,
+              denyReason: `Exceeds per-transfer cap of $${maxUsd.toFixed(2)}.`,
+              suggestion: `Split into smaller transfers or ask the owner to raise the cap.`
+            });
+          }
+        }
+
+        const cooldown = await this.vault.getTransferCooldown();
+        if (cooldown > 0n) {
+          // Cooldown is enforced on-chain, but we surface it early for UX
+        }
+
+        const deadmanStatus = await this.vault.getDeadmanStatus();
+        if (deadmanStatus.triggered) {
+          return this._formatDenial({
+            amount,
+            reason,
+            label: recipientConfig.label,
+            senderAddress,
+            denyReason: 'The deadman switch has been triggered. The vault owner must send a heartbeat to re-enable transfers.',
+            suggestion: 'Contact the vault owner to record a heartbeat.'
+          });
+        }
+      } catch (e) {
+        // V3 checks are best-effort — if contract doesn't support them, continue
+      }
+
+      // ── Step 8: Execute the transfer (V3 EIP-712) ──────────────────
       const memo = this._buildMemo(reason, recipientConfig.label);
-      const txResult = await this.vault.agentTransfer(senderAddress, amount, memo);
+      const txResult = await this.vault.signAndExecuteTransfer(senderAddress, amount, memo);
 
       // ── Step 9: Format success response ─────────────────────────────
       return this._formatApproval({
@@ -309,6 +347,33 @@ class AgentVaultManager {
         }
       }
 
+      // ── V3: Fetch additional status info ──────────────────────────
+      let deadmanStatus = null;
+      let pendingRotation = null;
+      let maxPerTransfer = 0n;
+      let transferCooldown = 0n;
+      let onChainHistory = [];
+
+      try {
+        deadmanStatus = await this.vault.getDeadmanStatus();
+      } catch (e) { /* V3 not available */ }
+
+      try {
+        pendingRotation = await this.vault.getPendingAgentRotation();
+      } catch (e) { /* V3 not available */ }
+
+      try {
+        maxPerTransfer = await this.vault.getMaxPerTransfer();
+      } catch (e) { /* V3 not available */ }
+
+      try {
+        transferCooldown = await this.vault.getTransferCooldown();
+      } catch (e) { /* V3 not available */ }
+
+      try {
+        onChainHistory = await this.vault.getTransferHistoryOnChain(5);
+      } catch (e) { /* V3 not available */ }
+
       // Format for Telegram
       let formatted = `🏦 AgentVault Status${isPaused ? ' ⏸️ PAUSED' : ''}\n\n`;
       formatted += `💰 Balance: ${this.vault.formatUsd(balance)} USDC\n`;
@@ -317,7 +382,34 @@ class AgentVaultManager {
         formatted += `📊 Today's spending: ${this.vault.formatUsd(dailyVaultSpent)} / ${this.vault.formatUsd(dailyVaultLimit)} limit\n`;
       }
 
-      formatted += `👥 Active recipients: ${recipients.filter(r => r.active).length}\n\n`;
+      if (maxPerTransfer > 0n) {
+        formatted += `🔒 Max per transfer: ${this.vault.formatUsd(maxPerTransfer)}\n`;
+      }
+
+      if (transferCooldown > 0n) {
+        formatted += `⏱️ Transfer cooldown: ${Number(transferCooldown)}s\n`;
+      }
+
+      formatted += `👥 Active recipients: ${recipients.filter(r => r.active).length}\n`;
+
+      // Deadman switch status
+      if (deadmanStatus) {
+        if (deadmanStatus.triggered) {
+          formatted += `\n💀 DEADMAN SWITCH TRIGGERED — owner heartbeat required!\n`;
+        } else {
+          const daysRemaining = Math.floor(deadmanStatus.secondsRemaining / 86400);
+          formatted += `\n💓 Deadman: ${daysRemaining}d remaining (${deadmanStatus.deadlineDays}d window)\n`;
+        }
+      }
+
+      // Pending agent rotation
+      if (pendingRotation && pendingRotation.newAgent !== ethers.ZeroAddress) {
+        const activationDate = new Date(pendingRotation.activationTime * 1000).toISOString();
+        formatted += `\n🔄 Agent rotation pending → ${pendingRotation.newAgent.slice(0, 10)}...\n`;
+        formatted += `   Activates: ${activationDate}\n`;
+      }
+
+      formatted += `\n`;
 
       for (const r of recipients) {
         if (r.error) {
@@ -328,12 +420,29 @@ class AgentVaultManager {
         formatted += `   Daily: ${r.dailySpent}/${r.dailyLimit} | Monthly: ${r.monthlySpent}/${r.monthlyLimit}\n\n`;
       }
 
+      // On-chain transfer history
+      if (onChainHistory.length > 0) {
+        formatted += `📜 Recent transfers (on-chain):\n`;
+        for (const tx of onChainHistory) {
+          if (tx.timestamp === 0) continue; // skip empty slots
+          const date = new Date(tx.timestamp * 1000);
+          const dateStr = date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+          formatted += `   💸 ${tx.amountFormatted} → ${tx.to.slice(0, 8)}... — ${tx.memo} (${dateStr})\n`;
+        }
+        formatted += `\n`;
+      }
+
       return {
         balance: this.vault.formatUsd(balance),
         balanceRaw: balance,
         recipientCount: recipientAddresses.length,
         recipients,
         isPaused,
+        deadmanStatus,
+        pendingRotation,
+        maxPerTransfer: maxPerTransfer > 0n ? this.vault.formatUsd(maxPerTransfer) : null,
+        transferCooldown: transferCooldown > 0n ? Number(transferCooldown) : null,
+        onChainHistory,
         formatted
       };
     } catch (err) {
@@ -439,6 +548,45 @@ class AgentVaultManager {
       return { transactions: txs, formatted };
     } catch (err) {
       throw new VaultError(`Failed to get transaction history: ${err.message}`, 'HISTORY_ERROR');
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  //  V3: On-Chain Transfer History
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Get transfer history from V3 on-chain storage (not events).
+   * @param {number} [count=20] - Number of recent transfers
+   * @returns {Object} { transactions, formatted }
+   */
+  async getTransferHistoryV3(count = 20) {
+    try {
+      const txs = await this.vault.getTransferHistoryOnChain(count);
+      // Filter out empty slots (timestamp = 0)
+      const validTxs = txs.filter(tx => tx.timestamp > 0);
+
+      let formatted = `📜 Transfer History — On-Chain (${validTxs.length} transfers)\n\n`;
+
+      if (validTxs.length === 0) {
+        formatted += 'No transfers found.';
+      } else {
+        for (const tx of validTxs) {
+          const normalizedAddr = tx.to.toLowerCase();
+          const label = this.recipientEngines[normalizedAddr]?.config?.label || tx.to.slice(0, 10) + '...';
+          const date = new Date(tx.timestamp * 1000);
+          const dateStr = date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+          const timeStr = date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+
+          formatted += `💸 ${tx.amountFormatted} → ${label}\n`;
+          formatted += `   📝 ${tx.memo}\n`;
+          formatted += `   🕐 ${dateStr} ${timeStr} | Nonce: ${tx.nonce}\n\n`;
+        }
+      }
+
+      return { transactions: validTxs, formatted };
+    } catch (err) {
+      throw new VaultError(`Failed to get V3 transfer history: ${err.message}`, 'HISTORY_ERROR');
     }
   }
 

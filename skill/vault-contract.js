@@ -17,13 +17,19 @@ const AGENT_VAULT_ABI = [
   // ── Structs (used in function returns) ──────────────────────────────────
   // Recipient struct is returned by getRecipient()
 
-  // ── Events ──────────────────────────────────────────────────────────────
-  "event TransferExecuted(address indexed to, uint256 amount, string memo, uint256 timestamp)",
+  // ── Events (V3) ────────────────────────────────────────────────────────
+  "event TransferExecuted(address indexed to, uint256 amount, string memo, uint256 timestamp, uint256 nonce)",
+  "event EmergencyDrain(address indexed to, uint256 amount)",
+  "event MaxPerTransferUpdated(uint256 newMax)",
+  "event TransferCooldownUpdated(uint256 newCooldown)",
+  "event DeadmanDaysUpdated(uint256 newDays)",
+  "event OwnerHeartbeatRecorded(uint256 timestamp)",
+  "event AgentRotationProposed(address indexed newAgent, uint256 activationTime)",
+  "event AgentRotationActivated(address indexed newAgent)",
+  "event AgentRotationCancelled()",
   "event RecipientAdded(address indexed recipient, string label)",
   "event RecipientRemoved(address indexed recipient)",
-  "event AgentUpdated(address indexed newAgent)",
   "event Deposited(address indexed from, uint256 amount)",
-  "event DailyVaultLimitUpdated(uint256 newLimit)",
 
   // ── Owner Functions ─────────────────────────────────────────────────────
   "function addRecipient(address _recipient, string _label, string _purpose, uint256 _dailyLimit, uint256 _monthlyLimit) external",
@@ -35,7 +41,20 @@ const AGENT_VAULT_ABI = [
   "function pause() external",
   "function unpause() external",
 
-  // ── Agent Functions ─────────────────────────────────────────────────────
+  // ── V3 Owner Functions ──────────────────────────────────────────────────
+  "function emergencyDrain() external",
+  "function setMaxPerTransfer(uint256 _max) external",
+  "function setTransferCooldown(uint256 _seconds) external",
+  "function setDeadmanDays(uint256 _days) external",
+  "function ownerHeartbeat() external",
+  "function rotateAgent(address _newAgent) external",
+  "function activateAgent() external",
+  "function cancelAgentRotation() external",
+
+  // ── Agent Functions (V3 — EIP-712 meta-tx) ──────────────────────────────
+  "function executeTransfer(address _to, uint256 _amount, string _memo, uint256 _nonce, uint256 _deadline, bytes _signature) external",
+
+  // ── Agent Functions (V1 — deprecated) ───────────────────────────────────
   "function agentTransfer(address _to, uint256 _amount, string _memo) external",
 
   // ── Public Functions ────────────────────────────────────────────────────
@@ -46,7 +65,22 @@ const AGENT_VAULT_ABI = [
   "function getRecipientList() external view returns (address[])",
   "function getVaultBalance() external view returns (uint256)",
 
-  // ── Standard (likely present in implementation) ─────────────────────────
+  // ── V3 View Functions ──────────────────────────────────────────────────
+  "function getTransferHistory(uint256 _count) external view returns (tuple(address to, uint256 amount, string memo, uint256 timestamp, uint256 nonce)[])",
+  "function getPendingAgentRotation() external view returns (address newAgent, uint256 activationTime)",
+  "function getDeadmanStatus() external view returns (bool triggered, uint256 lastHeartbeat, uint256 deadlineDays, uint256 secondsRemaining)",
+  "function getRemainingDailyAllowance(address _recipient) external view returns (uint256)",
+  "function getRemainingMonthlyAllowance(address _recipient) external view returns (uint256)",
+  "function getDomainSeparator() external view returns (bytes32)",
+  "function maxPerTransfer() external view returns (uint256)",
+  "function transferCooldown() external view returns (uint256)",
+  "function transferNonce() external view returns (uint256)",
+  "function deadmanDays() external view returns (uint256)",
+  "function lastOwnerHeartbeat() external view returns (uint256)",
+  "function pendingAgent() external view returns (address)",
+  "function pendingAgentActivation() external view returns (uint256)",
+
+  // ── Standard ────────────────────────────────────────────────────────────
   "function owner() external view returns (address)",
   "function agent() external view returns (address)",
   "function paused() external view returns (bool)",
@@ -255,9 +289,11 @@ class VaultContract {
   // ═══════════════════════════════════════════════════════════════════════
 
   /**
-   * Execute a USDC transfer from the vault to a recipient.
+   * [DEPRECATED] V1 agent transfer — use signAndExecuteTransfer() for V3.
+   * Execute a USDC transfer from the vault to a recipient (V1 direct call).
    * Only callable by the agent.
    *
+   * @deprecated Use signAndExecuteTransfer() instead (V3 EIP-712 meta-tx).
    * @param {string} to - Recipient address
    * @param {number|string} amount - Amount in USD (e.g. 200 = $200)
    * @param {string} memo - Transaction memo/reason
@@ -289,8 +325,270 @@ class VaultContract {
     }
   }
 
+  /**
+   * V3: Sign and execute a transfer using EIP-712 typed data signature.
+   * This is the primary transfer method for V3 contracts.
+   *
+   * @param {string} to - Recipient address
+   * @param {number|string} amount - Amount in USD (e.g. 200 = $200)
+   * @param {string} memo - Transaction memo/reason
+   * @returns {Object} { txHash, blockNumber, gasUsed, explorerUrl, success }
+   */
+  async signAndExecuteTransfer(to, amount, memo) {
+    try {
+      const amountUnits = this.toUsdcUnits(amount);
+      const nonce = await this.contract.transferNonce();
+      const latestBlock = await this.provider.getBlock('latest');
+      const deadline = latestBlock.timestamp + 3600;
+
+      const domain = {
+        name: "AgentVaultV3",
+        version: "1",
+        chainId: 84532,
+        verifyingContract: this.contractAddress,
+      };
+      const types = {
+        Transfer: [
+          { name: "to", type: "address" },
+          { name: "amount", type: "uint256" },
+          { name: "memo", type: "string" },
+          { name: "nonce", type: "uint256" },
+          { name: "deadline", type: "uint256" },
+        ],
+      };
+      const value = { to, amount: amountUnits, memo, nonce, deadline };
+      const signature = await this.signer.signTypedData(domain, types, value);
+
+      const tx = await this.contract.executeTransfer(to, amountUnits, memo, nonce, deadline, signature);
+      const receipt = await tx.wait();
+      return {
+        txHash: receipt.hash,
+        blockNumber: receipt.blockNumber,
+        gasUsed: receipt.gasUsed.toString(),
+        explorerUrl: this.explorerLink(receipt.hash),
+        success: true
+      };
+    } catch (err) {
+      throw this._parseError(err, 'TRANSFER_ERROR');
+    }
+  }
+
   // ═══════════════════════════════════════════════════════════════════════
-  //  Write Functions (Owner)
+  //  V3 Read Functions
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * V3: Get on-chain transfer history.
+   * @param {number} count - Number of recent transfers to retrieve
+   * @returns {Array} Array of transfer records
+   */
+  async getTransferHistoryOnChain(count = 10) {
+    try {
+      const records = await this.contractReadOnly.getTransferHistory(count);
+      return records.map(r => ({
+        to: r.to || r[0],
+        amount: r.amount ?? r[1],
+        amountFormatted: this.formatUsd(r.amount ?? r[1]),
+        memo: r.memo || r[2],
+        timestamp: Number(r.timestamp ?? r[3]),
+        date: new Date(Number(r.timestamp ?? r[3]) * 1000).toISOString(),
+        nonce: Number(r.nonce ?? r[4])
+      }));
+    } catch (err) {
+      throw new VaultError(`Failed to get on-chain transfer history: ${err.message}`, 'READ_ERROR');
+    }
+  }
+
+  /**
+   * V3: Get deadman switch status.
+   * @returns {Object} { triggered, lastHeartbeat, deadlineDays, secondsRemaining }
+   */
+  async getDeadmanStatus() {
+    try {
+      const result = await this.contractReadOnly.getDeadmanStatus();
+      return {
+        triggered: result.triggered ?? result[0],
+        lastHeartbeat: Number(result.lastHeartbeat ?? result[1]),
+        deadlineDays: Number(result.deadlineDays ?? result[2]),
+        secondsRemaining: Number(result.secondsRemaining ?? result[3])
+      };
+    } catch (err) {
+      throw new VaultError(`Failed to get deadman status: ${err.message}`, 'READ_ERROR');
+    }
+  }
+
+  /**
+   * V3: Get pending agent rotation info.
+   * @returns {Object} { newAgent, activationTime }
+   */
+  async getPendingAgentRotation() {
+    try {
+      const result = await this.contractReadOnly.getPendingAgentRotation();
+      return {
+        newAgent: result.newAgent ?? result[0],
+        activationTime: Number(result.activationTime ?? result[1])
+      };
+    } catch (err) {
+      throw new VaultError(`Failed to get pending agent rotation: ${err.message}`, 'READ_ERROR');
+    }
+  }
+
+  /**
+   * V3: Get remaining daily allowance for a recipient.
+   * @param {string} address - Recipient address
+   * @returns {bigint}
+   */
+  async getRemainingDailyAllowance(address) {
+    try {
+      return await this.contractReadOnly.getRemainingDailyAllowance(address);
+    } catch (err) {
+      throw new VaultError(`Failed to get daily allowance: ${err.message}`, 'READ_ERROR');
+    }
+  }
+
+  /**
+   * V3: Get remaining monthly allowance for a recipient.
+   * @param {string} address - Recipient address
+   * @returns {bigint}
+   */
+  async getRemainingMonthlyAllowance(address) {
+    try {
+      return await this.contractReadOnly.getRemainingMonthlyAllowance(address);
+    } catch (err) {
+      throw new VaultError(`Failed to get monthly allowance: ${err.message}`, 'READ_ERROR');
+    }
+  }
+
+  /**
+   * V3: Get max per-transfer cap.
+   * @returns {bigint}
+   */
+  async getMaxPerTransfer() {
+    try {
+      return await this.contractReadOnly.maxPerTransfer();
+    } catch (err) {
+      return 0n;
+    }
+  }
+
+  /**
+   * V3: Get transfer cooldown period in seconds.
+   * @returns {bigint}
+   */
+  async getTransferCooldown() {
+    try {
+      return await this.contractReadOnly.transferCooldown();
+    } catch (err) {
+      return 0n;
+    }
+  }
+
+  /**
+   * V3: Get current transfer nonce.
+   * @returns {bigint}
+   */
+  async getTransferNonce() {
+    try {
+      return await this.contractReadOnly.transferNonce();
+    } catch (err) {
+      return 0n;
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  //  V3 Write Functions (Owner)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /** V3: Emergency drain — withdraws all USDC to owner. */
+  async emergencyDrain() {
+    try {
+      const tx = await this.contract.emergencyDrain();
+      const receipt = await tx.wait();
+      return { txHash: receipt.hash, explorerUrl: this.explorerLink(receipt.hash), success: true };
+    } catch (err) {
+      throw this._parseError(err, 'EMERGENCY_DRAIN_ERROR');
+    }
+  }
+
+  /** V3: Record owner heartbeat for deadman switch. */
+  async ownerHeartbeat() {
+    try {
+      const tx = await this.contract.ownerHeartbeat();
+      const receipt = await tx.wait();
+      return { txHash: receipt.hash, explorerUrl: this.explorerLink(receipt.hash), success: true };
+    } catch (err) {
+      throw this._parseError(err, 'HEARTBEAT_ERROR');
+    }
+  }
+
+  /** V3: Propose agent rotation (timelock). */
+  async rotateAgent(newAgent) {
+    try {
+      const tx = await this.contract.rotateAgent(newAgent);
+      const receipt = await tx.wait();
+      return { txHash: receipt.hash, explorerUrl: this.explorerLink(receipt.hash), success: true };
+    } catch (err) {
+      throw this._parseError(err, 'ROTATE_AGENT_ERROR');
+    }
+  }
+
+  /** V3: Activate a pending agent rotation after timelock. */
+  async activateAgent() {
+    try {
+      const tx = await this.contract.activateAgent();
+      const receipt = await tx.wait();
+      return { txHash: receipt.hash, explorerUrl: this.explorerLink(receipt.hash), success: true };
+    } catch (err) {
+      throw this._parseError(err, 'ACTIVATE_AGENT_ERROR');
+    }
+  }
+
+  /** V3: Cancel a pending agent rotation. */
+  async cancelAgentRotation() {
+    try {
+      const tx = await this.contract.cancelAgentRotation();
+      const receipt = await tx.wait();
+      return { txHash: receipt.hash, explorerUrl: this.explorerLink(receipt.hash), success: true };
+    } catch (err) {
+      throw this._parseError(err, 'CANCEL_ROTATION_ERROR');
+    }
+  }
+
+  /** V3: Set maximum amount per transfer. */
+  async setMaxPerTransfer(amount) {
+    try {
+      const tx = await this.contract.setMaxPerTransfer(this.toUsdcUnits(amount));
+      const receipt = await tx.wait();
+      return { txHash: receipt.hash, explorerUrl: this.explorerLink(receipt.hash), success: true };
+    } catch (err) {
+      throw this._parseError(err, 'SET_MAX_PER_TRANSFER_ERROR');
+    }
+  }
+
+  /** V3: Set cooldown period between transfers (in seconds). */
+  async setTransferCooldown(seconds) {
+    try {
+      const tx = await this.contract.setTransferCooldown(seconds);
+      const receipt = await tx.wait();
+      return { txHash: receipt.hash, explorerUrl: this.explorerLink(receipt.hash), success: true };
+    } catch (err) {
+      throw this._parseError(err, 'SET_COOLDOWN_ERROR');
+    }
+  }
+
+  /** V3: Set deadman switch days. */
+  async setDeadmanDays(days) {
+    try {
+      const tx = await this.contract.setDeadmanDays(days);
+      const receipt = await tx.wait();
+      return { txHash: receipt.hash, explorerUrl: this.explorerLink(receipt.hash), success: true };
+    } catch (err) {
+      throw this._parseError(err, 'SET_DEADMAN_DAYS_ERROR');
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  //  Write Functions (Owner) — V1
   // ═══════════════════════════════════════════════════════════════════════
 
   /**
@@ -501,7 +799,7 @@ class VaultContract {
   _parseError(err, code) {
     const message = err.message || String(err);
 
-    // Common Solidity revert reasons
+    // Common Solidity revert reasons (V1 + V3)
     const revertPatterns = {
       'not the agent': 'Only the authorized agent can execute transfers.',
       'not the owner': 'Only the vault owner can perform this action.',
@@ -514,7 +812,14 @@ class VaultContract {
       'zero address': 'Invalid address provided.',
       'already exists': 'This recipient is already whitelisted.',
       'ERC20: insufficient allowance': 'USDC allowance too low. Please approve first.',
-      'ERC20: transfer amount exceeds balance': 'Insufficient USDC balance.'
+      'ERC20: transfer amount exceeds balance': 'Insufficient USDC balance.',
+      // V3-specific revert reasons
+      'signature expired': 'The EIP-712 signature has expired. Please retry the transfer.',
+      'invalid nonce': 'Invalid transfer nonce. The nonce may have been used already.',
+      'deadman switch triggered': 'The deadman switch has been triggered. The vault owner must send a heartbeat.',
+      'transfer cooldown active': 'Transfer cooldown is active. Please wait before making another transfer.',
+      'exceeds per-transfer cap': 'This amount exceeds the per-transfer maximum cap.',
+      'invalid signature': 'The EIP-712 signature is invalid. Agent key mismatch or corrupted data.'
     };
 
     for (const [pattern, humanMessage] of Object.entries(revertPatterns)) {

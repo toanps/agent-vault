@@ -31,9 +31,27 @@ You are the **agent** — a fiduciary AI that:
 ### Setup
 The skill loads from `config.json` in the skill directory. The config contains:
 - Contract address and RPC URL
-- Agent private key (for signing transactions)
+- Agent private key (for signing EIP-712 meta-transactions)
 - Recipient list with per-recipient conditions
 - Global rules that apply to all requests
+
+### V3 Architecture
+
+AgentVault V3 uses **EIP-712 typed data signatures** for all transfers. Instead of the agent calling `agentTransfer()` directly, the agent:
+1. Signs a typed `Transfer` struct off-chain (to, amount, memo, nonce, deadline)
+2. Submits the signature via `executeTransfer()` on-chain
+3. The contract verifies the signature matches the authorized agent
+
+This provides **replay protection** (nonce), **time-bounding** (deadline), and full **auditability** of agent intent.
+
+### V3 Security Features
+
+- **🔒 Per-Transfer Cap** — Maximum amount per single transfer (`maxPerTransfer`)
+- **⏱️ Transfer Cooldown** — Minimum time between transfers (`transferCooldown`)
+- **💀 Deadman Switch** — If the owner doesn't heartbeat within `deadmanDays`, transfers are frozen
+- **🔄 Agent Rotation** — Timelocked agent key rotation (`rotateAgent` → wait → `activateAgent`)
+- **🚨 Emergency Drain** — Owner can drain all funds instantly
+- **📜 On-Chain History** — Transfer history stored in contract (not just events)
 
 ### Processing a Fund Request
 
@@ -52,23 +70,28 @@ When someone requests funds, follow this exact flow:
    → Call getRecipient() to see daily/monthly spent and limits
    → If over limit: deny with remaining allowance info
 
-4. EVALUATE conditions
+4. V3 PRE-FLIGHT CHECKS
+   → Check maxPerTransfer — deny if amount exceeds cap
+   → Check deadman switch — deny if triggered (owner must heartbeat)
+   → Check transfer cooldown — warn if still in cooldown window
+
+5. EVALUATE conditions
    → Run through recipient-specific conditions
    → Run through global rules
    → The condition engine handles: amount caps, category matching,
      time-based rules, escalation thresholds
 
-5. DECIDE
+6. DECIDE
    → If all conditions pass: approve and execute transfer
    → If any condition fails: explain which rule blocked it
    → If escalation needed: notify owner and wait
 
-6. EXECUTE (if approved)
-   → Call agentTransfer(address, amount, memo)
-   → memo = brief reason string
+7. EXECUTE (if approved)
+   → Sign EIP-712 Transfer struct (to, amount, memo, nonce, deadline)
+   → Call executeTransfer(to, amount, memo, nonce, deadline, signature)
    → Report tx hash to requester
 
-7. NOTIFY owner
+8. NOTIFY owner
    → On approvals: "✅ Sent $X to [Name] for [reason]"
    → On denials: "❌ Denied $X request from [Name]: [rule that blocked]"
    → On limit warnings: "⚠️ [Name] has used 80%+ of monthly limit"
@@ -117,24 +140,30 @@ Always format responses for Telegram with emojis:
 💡 Bob's remaining daily limit: $100.00
 ```
 
-**Vault Status:**
+**Vault Status (V3):**
 ```
 🏦 AgentVault Status
 
 💰 Balance: 5,000.00 USDC
 📊 Today's spending: $450.00 / $2,000.00 limit
+🔒 Max per transfer: $1,000.00
+⏱️ Transfer cooldown: 60s
 👥 Active recipients: 3
 
-┌─────────────────────────────────────┐
-│ 👤 Wife - Alice (household)         │
-│    Daily: $200/$500 | Monthly: $800/$2,000 │
-│                                     │
-│ 👤 Son - Bob (allowance)            │
-│    Daily: $50/$100 | Monthly: $200/$400  │
-│                                     │
-│ 👤 Employee - Carol (salary)        │
-│    Daily: $0/$5,000 | Monthly: $0/$5,000 │
-└─────────────────────────────────────┘
+💓 Deadman: 28d remaining (30d window)
+
+👤 Wife - Alice (household)
+   Daily: $200/$500 | Monthly: $800/$2,000
+
+👤 Son - Bob (allowance)
+   Daily: $50/$100 | Monthly: $200/$400
+
+👤 Employee - Carol (salary)
+   Daily: $0/$5,000 | Monthly: $0/$5,000
+
+📜 Recent transfers (on-chain):
+   💸 $200.00 → 0xAlice... — Alice: Grocery shopping (Jun 15)
+   💸 $50.00 → 0xBob... — Bob: School supplies (Jun 14)
 ```
 
 ## Using the Skill Code
@@ -145,7 +174,7 @@ const { AgentVaultManager } = require('./agent-vault');
 // Initialize with config
 const vault = new AgentVaultManager(config);
 
-// Process a request
+// Process a request (uses V3 EIP-712 signing internally)
 const result = await vault.processRequest(
   '0xRecipientAddress',
   200,        // amount in USD (not wei)
@@ -153,14 +182,17 @@ const result = await vault.processRequest(
   { telegramId: 'alice_123' }
 );
 
-// Get vault status
+// Get vault status (includes V3: deadman, rotation, caps)
 const status = await vault.getVaultStatus();
 
 // Get recipient info
 const info = await vault.getRecipientInfo('0xRecipientAddress');
 
-// Get transaction history
-const history = await vault.getTransactionHistory({
+// Get transaction history (V3 on-chain)
+const history = await vault.getTransferHistoryV3(20);
+
+// Get transaction history (legacy event-based)
+const legacyHistory = await vault.getTransactionHistory({
   recipient: '0xAddress', // optional filter
   fromBlock: 0,           // optional
   limit: 20               // optional
