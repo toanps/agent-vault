@@ -1,0 +1,37 @@
+{
+  "name": "agent-vault",
+  "version": "1.0.0",
+  "description": "AgentVault — AI-managed USDC wealth wallet for the Moltbook Hackathon",
+  "scripts": {
+    "compile": "npx hardhat compile",
+    "test": "npx hardhat test",
+    "test:gas": "REPORT_GAS=true npx hardhat test",
+    "deploy:base-sepolia": "npx hardhat run deploy/deploy.js --network baseSepolia",
+    "verify": "npx hardhat verify --network baseSepolia",
+    "clean": "npx hardhat clean",
+    "coverage": "npx hardhat coverage"
+  },
+  "keywords": [
+    "solidity",
+    "usdc",
+    "ai-agent",
+    "vault",
+    "base",
+    "hackathon"
+  ],
+  "author": "AgentVault Team",
+  "license": "MIT",
+  "devDependencies": {
+    "@nomicfoundation/hardhat-chai-matchers": "^2.1.0",
+    "@nomicfoundation/hardhat-ethers": "^3.0.8",
+    "@nomicfoundation/hardhat-network-helpers": "^1.0.12",
+    "@nomicfoundation/hardhat-verify": "^2.0.12",
+    "chai": "^4.3.10",
+    "dotenv": "^16.4.7",
+    "ethers": "^6.13.4",
+    "hardhat": "^2.22.17"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "^5.1.0"
+  }
+}

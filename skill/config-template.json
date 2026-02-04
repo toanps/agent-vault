@@ -1,0 +1,38 @@
+{
+  "network": "base-sepolia",
+  "rpcUrl": "https://sepolia.base.org",
+  "contractAddress": "",
+  "agentPrivateKey": "",
+  "usdcAddress": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+  "recipients": {
+    "0xAlice000000000000000000000000000000000000": {
+      "label": "Wife - Alice",
+      "purpose": "household",
+      "telegramId": "alice_123",
+      "conditions": [
+        "Max $500/month for groceries and household expenses",
+        "Auto-approve utility bills (electricity, water, internet)",
+        "Requests over $200 require a reason"
+      ]
+    },
+    "0xBob0000000000000000000000000000000000000": {
+      "label": "Son - Bob",
+      "purpose": "allowance",
+      "telegramId": "bob_456",
+      "conditions": [
+        "Weekly allowance of $100, resets Monday",
+        "Extra funds only for education expenses",
+        "Deny gaming or entertainment requests over $50"
+      ]
+    }
+  },
+  "globalRules": [
+    "Total daily vault spending cannot exceed $2000",
+    "Requests over $1000 always need owner approval",
+    "Log all transactions to owner"
+  ],
+  "ownerNotification": {
+    "channel": "telegram",
+    "notifyOn": ["approval", "denial", "limit_reached"]
+  }
+}
