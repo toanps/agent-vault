@@ -6,24 +6,41 @@ Built for the **USDC Moltbook Hackathon** on **Base Sepolia**.
 
 ---
 
+## 📦 Versions
+
+| Version | Address | Key Features |
+|---------|---------|--------------|
+| **v1** | [`0xe52727A328Ff9C2bB394B821C2b762D1a147910C`](https://sepolia.basescan.org/address/0xe52727A328Ff9C2bB394B821C2b762D1a147910C) | Basic vault: whitelist, daily/monthly limits, agent transfers |
+| **v3** | [`0x9b8606cE2F194b0B487fB857533d70451157978e`](https://sepolia.basescan.org/address/0x9b8606cE2F194b0B487fB857533d70451157978e) | Zero-Trust Meta-Tx: EIP-712 signatures, deadman switch, agent rotation timelock |
+
+---
+
 ## 🧠 Architecture
 
+### V3 — Zero-Trust Meta-Transaction Architecture
+
 ```
-┌──────────────┐    agentTransfer()    ┌───────────────┐    USDC    ┌──────────────┐
-│   AI Agent   │ ────────────────────► │  AgentVault   │ ────────► │   Family     │
-│  (Clawdbot)  │   (within limits)     │  (on-chain)   │           │  Members     │
-└──────────────┘                       └───────────────┘           └──────────────┘
-      │                                       ▲
-      │ can ONLY call                         │ full admin
-      │ agentTransfer()                       │ controls
-      ▼                                  ┌────┴──────┐
- Guardrails:                             │   Owner   │
- • Whitelist only                        │  (Human)  │
- • Daily limits per recipient            └───────────┘
- • Monthly limits per recipient
- • Vault-wide daily cap
- • Pausable (emergency stop)
+┌──────────────┐  EIP-712 sig   ┌─────────────┐  relay   ┌───────────────┐
+│   AI Agent   │ ────────────► │   Relayer    │ ───────► │ AgentVaultV3  │
+│  (no ETH!)   │  off-chain     │  (anyone)    │ on-chain │  (on-chain)   │
+└──────────────┘                └─────────────┘          └───────────────┘
+                                                                ▲
+     Agent signs, never submits tx                              │ full admin
+     → Needs ZERO gas/ETH                                 ┌────┴──────┐
+                                                           │   Owner   │
+ V3 Guardrails:                                            │  (Human)  │
+ • EIP-712 meta-transactions                               └───────────┘
+ • Per-transfer cap
+ • Transfer cooldown
+ • Deadman switch (auto-pause)
+ • Agent rotation with 24h timelock
+ • Transfer nonce + deadline (replay protection)
+ • On-chain transfer history (last 50)
+ • Emergency drain (one call)
+ • + All v1 guardrails (whitelist, daily/monthly limits, pause)
 ```
+
+---
 
 ## 🔑 Key Concepts
 
@@ -31,31 +48,26 @@ Built for the **USDC Moltbook Hackathon** on **Base Sepolia**.
 
 | Role | Who | Can Do |
 |------|-----|--------|
-| **Owner** (human) | Vault creator | Add/remove recipients, set limits, pause, emergency withdraw, change agent |
-| **Agent** (AI) | Clawdbot wallet | ONLY `agentTransfer()` — send USDC to whitelisted addresses within limits |
+| **Owner** (human) | Vault creator | Full admin: recipients, limits, pause, drain, agent rotation |
+| **Agent** (AI) | Clawdbot wallet | Sign EIP-712 transfer intents (needs no ETH) |
+| **Relayer** (anyone) | Any wallet | Submit agent-signed transfers on-chain |
 
-### Recipient Whitelist
+### V3 Security Features
 
-Each recipient has:
-- **Label** — Human-readable name ("Wife - Alice")
-- **Purpose** — Category ("household", "allowance", "salary")
-- **Daily Limit** — Max USDC per day (auto-resets every 24h)
-- **Monthly Limit** — Max USDC per 30 days (auto-resets)
-- **Spend Tracking** — On-chain daily and monthly spend counters
-- **Active Flag** — Can be deactivated without deletion
-
-### Multi-Layer Security
-
-1. **Agent Role** — Only the designated agent wallet can call `agentTransfer()`
-2. **Whitelist** — Can only send to pre-approved recipients
-3. **Per-Recipient Limits** — Daily and monthly caps per person
-4. **Vault-Wide Limit** — Total daily cap across all recipients
-5. **Pausable** — Owner can freeze all transfers instantly
-6. **OpenZeppelin** — Built on battle-tested Ownable, Pausable, ReentrancyGuard
+| Feature | Description |
+|---------|-------------|
+| **Meta-Transactions** | Agent signs off-chain via EIP-712. Anyone can relay. Agent needs zero ETH. |
+| **Per-Transfer Cap** | Hard limit on any single transfer amount |
+| **Transfer Cooldown** | Minimum seconds between consecutive transfers |
+| **Deadman Switch** | Auto-blocks transfers if owner doesn't heartbeat within N days |
+| **Agent Rotation Timelock** | 24-hour delay before new agent activates (cancel anytime) |
+| **Nonce + Deadline** | Replay protection + signatures expire after deadline |
+| **On-Chain History** | Last 50 transfers stored on-chain for auditing |
+| **Emergency Drain** | One-call, no-params: sends ALL USDC to owner instantly |
 
 ---
 
-## 📋 Contract Interface
+## 📋 V3 Contract Interface
 
 ### Owner Functions
 
@@ -66,47 +78,47 @@ removeRecipient(address)
 updateLimits(address, dailyLimit, monthlyLimit)
 
 // Agent management
-setAgent(address)
+setAgent(address)                  // Direct set (initial setup)
+rotateAgent(address newAgent)      // 24h timelock rotation
+activateAgent()                    // After timelock passes
+cancelAgentRotation()              // Cancel pending rotation
 
 // Vault controls
 setDailyVaultLimit(uint256)
-emergencyWithdraw(address to, uint256 amount)
-pause()
-unpause()
+setMaxPerTransfer(uint256)
+setTransferCooldown(uint256 seconds)
+setDeadmanDays(uint256 days)
+ownerHeartbeat()                   // Reset deadman switch
+emergencyDrain()                   // Drain ALL USDC to owner
+pause() / unpause()
 ```
 
-### Agent Functions
+### Meta-Transaction Transfer
 
 ```solidity
-// The ONLY function the AI agent can call
-agentTransfer(address to, uint256 amount, string memo)
-```
-
-### Public Functions
-
-```solidity
-deposit(uint256 amount)  // Anyone can fund the vault (requires USDC approval)
+// Anyone can call — verifies EIP-712 signature from agent
+executeTransfer(
+  address to,
+  uint256 amount,
+  string memo,
+  uint256 nonce,       // Must match current transferNonce
+  uint256 deadline,    // Signature expiration
+  bytes signature      // Agent's EIP-712 signature
+)
 ```
 
 ### View Functions
 
 ```solidity
-getRecipient(address)              // Full recipient details
-getRecipientList()                 // All recipient addresses
-getVaultBalance()                  // Current USDC balance
-getRemainingDailyAllowance(addr)   // How much a recipient can receive today
-getRemainingMonthlyAllowance(addr) // How much a recipient can receive this month
-```
-
-### Events
-
-```solidity
-TransferExecuted(address indexed to, uint256 amount, string memo, uint256 timestamp)
-RecipientAdded(address indexed recipient, string label)
-RecipientRemoved(address indexed recipient)
-AgentUpdated(address indexed newAgent)
-Deposited(address indexed from, uint256 amount)
-DailyVaultLimitUpdated(uint256 newLimit)
+getRecipient(address)                     // Full recipient details
+getRecipientList()                        // All recipient addresses
+getVaultBalance()                         // Current USDC balance
+getTransferHistory(uint256 count)         // Last N transfers
+getPendingAgentRotation()                 // Pending agent + activation time
+getDeadmanStatus()                        // Heartbeat, days, isExpired
+getRemainingDailyAllowance(address)       // Today's remaining allowance
+getRemainingMonthlyAllowance(address)     // This month's remaining
+getDomainSeparator()                      // EIP-712 domain (for off-chain signing)
 ```
 
 ---
@@ -116,7 +128,7 @@ DailyVaultLimitUpdated(uint256 newLimit)
 ### Prerequisites
 
 - Node.js >= 18
-- npm or yarn
+- npm
 
 ### Install
 
@@ -134,13 +146,17 @@ npm run compile
 ### Test
 
 ```bash
+# Run all tests (v1 + v3)
 npm test
+
+# Run v3 tests only
+npx hardhat test test/AgentVaultV3.test.js
 
 # With gas reporting
 npm run test:gas
 ```
 
-### Deploy to Base Sepolia
+### Deploy V3 to Base Sepolia
 
 1. Copy `.env.example` to `.env` and fill in your values:
 
@@ -148,36 +164,38 @@ npm run test:gas
 cp .env.example .env
 ```
 
-2. Update recipient addresses and agent address in `deploy/deploy.js`
-
-3. Deploy:
+2. Deploy:
 
 ```bash
-npm run deploy:base-sepolia
+npx hardhat run deploy/deploy-v3.js --network baseSepolia
 ```
 
-4. Verify on Basescan:
+3. Run demo (deposit, meta-tx transfer, emergency drain):
 
 ```bash
-npx hardhat verify --network baseSepolia <VAULT_ADDRESS> <USDC_ADDRESS> <DAILY_VAULT_LIMIT>
+npx hardhat run scripts/demo-v3.js --network baseSepolia
 ```
 
 ---
 
 ## 🧪 Test Coverage
 
-The test suite covers:
+### V3 Tests (52 tests)
 
 | Category | Tests |
 |----------|-------|
-| Deployment & Roles | Constructor validation, owner/agent setup |
-| Recipient Management | Add, remove, update limits, access control |
-| Agent Transfers | Within limits, exceeding limits, multi-recipient |
-| Daily/Monthly Resets | Auto-reset after time periods |
-| Pause/Unpause | Emergency stop and resume |
-| Deposits & Withdrawals | Funding vault, emergency withdraw |
-| Agent Management | Change agent, old agent blocked |
-| Vault Limits | Vault-wide daily cap enforcement |
+| Deployment & Constructor | Initialization, invalid params |
+| Owner Functions | Recipients, limits, settings, access control |
+| Emergency Drain | Full drain, events, empty vault, auth |
+| Meta-Tx Transfer (EIP-712) | Valid sig, bad sig, expired, bad nonce, replay, cap, whitelist, inactive, daily limit, paused |
+| Transfer Cooldown | Enforce cooldown, allow after cooldown |
+| Deadman Switch | Initial status, expired, heartbeat reset |
+| Agent Rotation | Propose, timelock, activate, cancel, same-agent, events |
+| Transfer History | Record, empty, cap |
+| Deposit | Accept, reject zero |
+| View Functions | Recipients, balance, domain separator, allowances |
+| Owner Heartbeat | Update timestamp, events |
+| Pause/Unpause | Pause, block transfers, allow drain when paused |
 
 ---
 
@@ -192,13 +210,16 @@ The test suite covers:
 | USDC | `0x036CbD53842c5426634e7929541eC2318f3dCF7e` |
 | Block Explorer | `https://sepolia.basescan.org` |
 
-### Default Limits
+### V3 Default Parameters
 
-| Limit | Value |
-|-------|-------|
+| Parameter | Default |
+|-----------|---------|
 | Vault Daily Limit | $10,000 |
-| Example Recipient Daily | $100 — $2,000 |
-| Example Recipient Monthly | $1,000 — $20,000 |
+| Max Per Transfer | $1,000 |
+| Transfer Cooldown | 60 seconds |
+| Deadman Days | 30 days |
+| Agent Rotation Delay | 24 hours |
+| Max History | 50 records |
 
 ---
 
@@ -207,15 +228,21 @@ The test suite covers:
 ```
 agent-vault/
 ├── contracts/
-│   ├── AgentVault.sol        # Main vault contract
-│   ├── IAgentVault.sol       # Interface
+│   ├── AgentVault.sol          # V1 vault contract
+│   ├── IAgentVault.sol         # V1 interface
+│   ├── AgentVaultV3.sol        # V3 zero-trust meta-tx vault
+│   ├── IAgentVaultV3.sol       # V3 interface
 │   └── test/
-│       └── MockUSDC.sol      # Mock token for tests
+│       └── MockUSDC.sol        # Mock token for tests
 ├── test/
-│   └── AgentVault.test.js    # Comprehensive test suite
+│   ├── AgentVault.test.js      # V1 test suite
+│   └── AgentVaultV3.test.js    # V3 test suite (52 tests)
 ├── deploy/
-│   └── deploy.js             # Base Sepolia deployment
-├── hardhat.config.js         # Hardhat configuration
+│   ├── deploy.js               # V1 deployment
+│   └── deploy-v3.js            # V3 deployment
+├── scripts/
+│   └── demo-v3.js              # V3 demo transactions
+├── hardhat.config.js
 ├── package.json
 ├── .env.example
 └── README.md
@@ -225,19 +252,18 @@ agent-vault/
 
 ## 🏆 Hackathon Notes
 
-**Why AgentVault?**
+**Why AgentVault V3?**
 
-Traditional wallets require manual transactions. AgentVault introduces a new paradigm: **AI-managed finance with on-chain guardrails**. The human sets the rules, the AI executes within them.
+V1 proved the concept. V3 makes it production-grade:
 
-**Use Cases:**
-- 👨‍👩‍👧‍👦 Family expense management — AI pays allowances, bills, groceries
-- 💼 Payroll distribution — AI handles recurring salary payments
-- 🏢 Treasury management — AI optimizes fund allocation within budget
-- 🎓 Education funds — AI distributes tuition and living expenses
+- **Zero-trust**: Agent signs, never touches ETH. If agent wallet is compromised, attacker can only sign (not submit). Relayer is a separate concern.
+- **Defense-in-depth**: 8 layers of guardrails, each independently enforceable.
+- **Deadman switch**: If the human disappears, the vault auto-freezes. No silent drain.
+- **Agent rotation timelock**: 24h to catch a malicious agent change.
 
 **Built with:**
 - Solidity ^0.8.20
-- OpenZeppelin v5 (Ownable, Pausable, ReentrancyGuard, SafeERC20)
+- OpenZeppelin v5 (Ownable, Pausable, ReentrancyGuard, SafeERC20, EIP712, ECDSA)
 - Hardhat
 - Base Sepolia (L2 for low gas costs)
 - USDC (stable, trusted, 6 decimals)
